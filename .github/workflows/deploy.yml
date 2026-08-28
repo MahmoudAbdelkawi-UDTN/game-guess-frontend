@@ -1,0 +1,358 @@
+name: Frontend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-production
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+  DEPLOY_DIR: 'D:\test\GG\GG-frontend\deploy'
+  PREVIOUS_DIR: 'D:\test\GG\GG-frontend\deploy.previous'
+  PUBLISH_DIR: 'D:\test\GG\GG-frontend\publish-temp'
+
+  VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+
+jobs:
+  build-test-deploy:
+    name: Build, Test and Deploy
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+
+    steps:
+
+      # ============================================================
+      # Checkout
+      # ============================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # Node.js
+      # ============================================================
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+
+      # ============================================================
+      # Validate configuration
+      # ============================================================
+
+      - name: Validate deployment configuration
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:VITE_API_BASE_URL)) {
+              throw "VITE_API_BASE_URL GitHub variable is not configured."
+          }
+
+          Write-Host "API URL: $env:VITE_API_BASE_URL"
+          Write-Host "Deploy directory: $env:DEPLOY_DIR"
+
+
+      # ============================================================
+      # Dependencies
+      # ============================================================
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm ci
+
+
+      # ============================================================
+      # Lint
+      # ============================================================
+
+      - name: Lint
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+
+          if ($package.scripts.lint) {
+              npm run lint
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Lint failed with exit code $LASTEXITCODE"
+              }
+          }
+          else {
+              Write-Host "No lint script found. Skipping."
+          }
+
+
+      # ============================================================
+      # Type Check
+      # ============================================================
+
+      - name: Type check
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+
+          if ($package.scripts.typecheck) {
+              npm run typecheck
+          }
+          elseif ($package.scripts.'type-check') {
+              npm run type-check
+          }
+          else {
+              Write-Host "No dedicated typecheck script found."
+              Write-Host "Build step will perform the project's configured checks."
+              exit 0
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Type check failed with exit code $LASTEXITCODE"
+          }
+
+
+      # ============================================================
+      # Tests
+      # ============================================================
+
+      - name: Run tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+
+          if ($package.scripts.test) {
+
+              npm run test -- --run
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Tests failed with exit code $LASTEXITCODE"
+              }
+          }
+          else {
+              Write-Host "No test script found. Skipping."
+          }
+
+
+      # ============================================================
+      # Build
+      # ============================================================
+
+      - name: Build production application
+        shell: powershell
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Building frontend..."
+          Write-Host "VITE_API_BASE_URL=$env:VITE_API_BASE_URL"
+
+          npm run build
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Frontend build failed with exit code $LASTEXITCODE"
+          }
+
+
+      # ============================================================
+      # Verify Build
+      # ============================================================
+
+      - name: Verify build output
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path ".\dist")) {
+              throw "dist directory was not generated."
+          }
+
+          if (-not (Test-Path ".\dist\index.html")) {
+              throw "dist\index.html was not generated."
+          }
+
+          Write-Host "Build output verified successfully."
+
+          Get-ChildItem ".\dist" |
+              Select-Object Name, Length
+
+
+      # ============================================================
+      # Prepare Staging
+      # ============================================================
+
+      - name: Prepare deployment staging
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $publishDir = $env:PUBLISH_DIR
+
+          if ([string]::IsNullOrWhiteSpace($publishDir)) {
+              throw "PUBLISH_DIR is not configured."
+          }
+
+          if (Test-Path $publishDir) {
+              Remove-Item $publishDir -Recurse -Force
+          }
+
+          New-Item `
+              -ItemType Directory `
+              -Path $publishDir `
+              -Force | Out-Null
+
+          robocopy ".\dist" $publishDir /MIR /R:2 /W:2
+
+          $code = $LASTEXITCODE
+
+          if ($code -ge 8) {
+              throw "Failed to prepare deployment staging. Robocopy exit code: $code"
+          }
+
+          $global:LASTEXITCODE = 0
+
+          if (-not (Test-Path "$publishDir\index.html")) {
+              throw "Staging verification failed: index.html not found."
+          }
+
+          Write-Host "Deployment staging prepared successfully."
+
+
+      # ============================================================
+      # Backup Current Deployment
+      # ============================================================
+
+      - name: Backup current deployment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $deployDir = $env:DEPLOY_DIR
+          $previousDir = $env:PREVIOUS_DIR
+
+          if (-not (Test-Path $deployDir)) {
+              Write-Host "No existing deployment found."
+              Write-Host "This appears to be the first deployment."
+              exit 0
+          }
+
+          if (-not (Test-Path "$deployDir\index.html")) {
+              Write-Host "Deploy directory exists but does not contain an existing frontend."
+              exit 0
+          }
+
+          if (Test-Path $previousDir) {
+              Remove-Item $previousDir -Recurse -Force
+          }
+
+          New-Item `
+              -ItemType Directory `
+              -Path $previousDir `
+              -Force | Out-Null
+
+          robocopy $deployDir $previousDir /MIR /R:2 /W:2
+
+          $code = $LASTEXITCODE
+
+          if ($code -ge 8) {
+              throw "Backup failed. Robocopy exit code: $code"
+          }
+
+          $global:LASTEXITCODE = 0
+
+          Write-Host "Previous deployment backed up successfully."
+
+
+      # ============================================================
+      # Deploy
+      # ============================================================
+
+      - name: Deploy frontend
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $publishDir = $env:PUBLISH_DIR
+          $deployDir = $env:DEPLOY_DIR
+
+          if (-not (Test-Path "$publishDir\index.html")) {
+              throw "Deployment source is invalid."
+          }
+
+          New-Item `
+              -ItemType Directory `
+              -Path $deployDir `
+              -Force | Out-Null
+
+          robocopy $publishDir $deployDir /MIR /R:2 /W:2
+
+          $code = $LASTEXITCODE
+
+          if ($code -ge 8) {
+              throw "Deployment failed. Robocopy exit code: $code"
+          }
+
+          $global:LASTEXITCODE = 0
+
+          if (-not (Test-Path "$deployDir\index.html")) {
+              throw "Deployment verification failed: index.html not found."
+          }
+
+          Write-Host "Frontend deployed successfully."
+
+
+      # ============================================================
+      # Cleanup
+      # ============================================================
+
+      - name: Cleanup staging
+        if: always()
+        shell: powershell
+        run: |
+          $publishDir = $env:PUBLISH_DIR
+
+          if (
+              -not [string]::IsNullOrWhiteSpace($publishDir) -and
+              (Test-Path $publishDir)
+          ) {
+              Remove-Item $publishDir -Recurse -Force
+          }
+
+
+      # ============================================================
+      # Summary
+      # ============================================================
+
+      - name: Deployment summary
+        if: success()
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " Frontend Deployment Successful"
+          Write-Host "=========================================="
+          Write-Host "Deploy directory : $env:DEPLOY_DIR"
+          Write-Host "API URL          : $env:VITE_API_BASE_URL"
+          Write-Host "=========================================="
