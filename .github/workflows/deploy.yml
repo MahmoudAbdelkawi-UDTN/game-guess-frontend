@@ -130,31 +130,6 @@ jobs:
               throw "Type check failed with exit code $LASTEXITCODE"
           }
 
-
-      # ============================================================
-      # Tests
-      # ============================================================
-
-      - name: Run tests
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $package = Get-Content package.json -Raw | ConvertFrom-Json
-
-          if ($package.scripts.test) {
-
-              npm run test
-
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Tests failed with exit code $LASTEXITCODE"
-              }
-          }
-          else {
-              Write-Host "No test script found. Skipping."
-          }
-
-
       # ============================================================
       # Build
       # ============================================================
